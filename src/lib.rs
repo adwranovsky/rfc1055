@@ -116,8 +116,14 @@ impl<T> Rfc1055Decoder<T> where
                     DecoderState::Escape => {
                         num_written += 1;
                         *item = match value {
-                            ESC_END => END,
-                            ESC_ESC => ESC,
+                            ESC_END => {
+                                self.state = DecoderState::WriteToBuf;
+                                END
+                            },
+                            ESC_ESC => {
+                                self.state = DecoderState::WriteToBuf;
+                                ESC
+                            },
                             _ => {
                                 self.state = DecoderState::DiscardToEnd;
                                 return Err(nb::Error::Other(DecodeError::BadEscape));
@@ -148,5 +154,6 @@ mod tests {
         let mut packet: [u8; 7] = [0; 7];
         let read_result = decoder.read(&mut packet[..]);
         assert_eq!(read_result, Ok(7));
+        assert_eq!(packet, [0xaa, 0xbb, 0xcc, END, ESC, 0xdd, 0xee]);
     }
 }
