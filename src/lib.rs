@@ -6,10 +6,10 @@
 
 pub use nb;
 
-const END: u8 = 0o300;
-const ESC: u8 = 0o333;
-const ESC_END: u8 = 0o334;
-const ESC_ESC: u8 = 0o335;
+pub const END: u8 = 0o300;
+pub const ESC: u8 = 0o333;
+pub const ESC_END: u8 = 0o334;
+pub const ESC_ESC: u8 = 0o335;
 
 #[derive(PartialEq)]
 #[derive(Debug)]
@@ -25,35 +25,52 @@ enum DecoderState {
     End,
 }
 
-pub struct Rfc1055Decoder<T>
+pub struct Decoder<T>
     where T: FnMut() -> nb::Result<u8,()>
 {
     state: DecoderState,
     reader: T,
 }
 
-impl<T> Rfc1055Decoder<T>
+impl<T> Decoder<T>
     where T: FnMut() -> nb::Result<u8,()>
 {
-    pub fn new(reader: T) -> Rfc1055Decoder<T> {
-        Rfc1055Decoder {
+    pub fn new(reader: T) -> Decoder<T> {
+        Decoder {
             state: DecoderState::DiscardToEnd,
             reader: reader,
         }
     }
 
-    /// Reads from the decoder into the given buffer.
     ///
-    /// 
+    /// Reads from the decoder into the given buffer. It mirrors the `std::io::Read::read` function
+    /// as closely as possible while adding support for `no_std` and the non-blocking crate.
+    ///
     ///
     /// # Arguments
     ///
     /// * `buf` - A u8 slice to write the decoded data into
     ///
     ///
-    ///
     /// # Examples
     ///
+    /// ```rust
+    /// use rfc1055::{
+    ///     END,
+    ///     ESC,
+    ///     ESC_END,
+    ///     ESC_ESC,
+    /// };
+    /// fn main() {
+    ///     let data_stream: [u8; 11] = [END, 0xaa, 0xbb, 0xcc, ESC, ESC_END, ESC, ESC_ESC, 0xdd, 0xee, END];
+    ///     let mut decoder = rfc1055::decode_from_buffer(&data_stream[..]);
+    ///     let mut packet: [u8; 7] = [0; 7];
+    ///
+    ///     let read_result = decoder.read(&mut packet[..]);
+    ///     assert_eq!(read_result, Ok(7));
+    ///     assert_eq!(packet, [0xaa, 0xbb, 0xcc, END, ESC, 0xdd, 0xee]);
+    /// }
+    /// ```
     ///
     pub fn read(&mut self, buf: &mut [u8]) -> nb::Result<usize, DecodeError> {
         let mut num_written: usize = 0;
@@ -140,7 +157,7 @@ impl<T> Rfc1055Decoder<T>
                     }
 
                     // All other states should be unreachable, so panic upon hitting them
-                    _ => panic!("The Rfc1055Decoder is in an invalid state!"),
+                    _ => panic!("The Decoder is in an invalid state!"),
                 }
             }
         }
@@ -149,7 +166,7 @@ impl<T> Rfc1055Decoder<T>
     }
 }
 
-pub fn from_buffer(buffer: &[u8]) -> Rfc1055Decoder<impl FnMut() -> nb::Result<u8,()> + '_> {
+pub fn decode_from_buffer(buffer: &[u8]) -> Decoder<impl FnMut() -> nb::Result<u8,()> + '_> {
     let mut buffer_iterator = buffer.iter();
     let reader = move || {
         match buffer_iterator.next() {
@@ -158,7 +175,7 @@ pub fn from_buffer(buffer: &[u8]) -> Rfc1055Decoder<impl FnMut() -> nb::Result<u
         }
     };
 
-    Rfc1055Decoder::new(reader)
+    Decoder::new(reader)
 }
 
 #[cfg(test)]
@@ -167,12 +184,26 @@ mod tests {
 
     #[test]
     fn test_decode_u8_slice() {
-        let data_stream: [u8; 11] = [END, 0xaa, 0xbb, 0xcc, ESC, ESC_END, ESC, ESC_ESC, 0xdd, 0xee, END];
-        let mut decoder = from_buffer(&data_stream[..]);
+        let data_stream: [u8; 11] = [END, 0x00, 0x11, 0x22, ESC, ESC_END, ESC, ESC_ESC, 0x33, 0x44, END];
+        let mut decoder = decode_from_buffer(&data_stream[..]);
 
-        let mut packet: [u8; 7] = [0; 7];
+        let mut packet: [u8; 128] = [0; 128];
         let read_result = decoder.read(&mut packet[..]);
         assert_eq!(read_result, Ok(7));
-        assert_eq!(packet, [0xaa, 0xbb, 0xcc, END, ESC, 0xdd, 0xee]);
+        assert_eq!(packet[0..7], [0x00, 0x11, 0x22, END, ESC, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn test_decode_errors() {
+        let data_stream: [u8; 4] = [END, ESC, 0x00, END];
+        let mut packet: [u8; 128] = [0; 128];
+
+        let mut decoder = decode_from_buffer(&data_stream[..]);
+        let read_result = decoder.read(&mut packet[..]);
+        assert_eq!(read_result, Err(nb::Error::Other(DecodeError::BadEscape)));
+
+        let mut decoder = Decoder::new(|| {Err(nb::Error::Other(()))});
+        let read_result = decoder.read(&mut packet[..]);
+        assert_eq!(read_result, Err(nb::Error::Other(DecodeError::ReadError)));
     }
 }
