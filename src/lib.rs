@@ -217,10 +217,8 @@ pub enum EncodeError {
 }
 
 enum EncoderState {
-    ReadFromBuf,
-    EscapeEscape,
-    EscapeEnd,
-    End,
+    WriteNext,
+    WriteSpecial(u8),
 }
 
 pub struct Encoder<T>
@@ -235,9 +233,37 @@ impl<T> Encoder<T>
 {
     pub fn new(writer: T) -> Encoder<T> {
         Encoder {
-            state: EncoderState::End,
+            state: EncoderState::WriteNext,
             writer: writer,
         }
+    }
+
+    fn write_one(&mut self, val: u8) -> nb::Result<(), EncodeError> {
+        match (self.writer)(val) {
+            Ok(_) => {Ok(())},
+            Err(nb::Error::WouldBlock) => {Err(nb::Error::WouldBlock)},
+            Err(nb::Error::Other(_)) => {Err(nb::Error::Other(EncodeError::WriteError))},
+        }
+    }
+
+    fn write_two(&mut self, first: u8, second: u8) -> nb::Result<(), EncodeError> {
+        match (self.writer)(first) {
+            Ok(_) => {},
+            Err(nb::Error::WouldBlock) => {return Err(nb::Error::WouldBlock);},
+            Err(nb::Error::Other(_)) => {return Err(nb::Error::Other(EncodeError::WriteError));},
+        }
+
+        self.state = EncoderState::WriteSpecial(second);
+
+        match (self.writer)(second) {
+            Ok(_) => {},
+            Err(nb::Error::WouldBlock) => {return Err(nb::Error::WouldBlock);},
+            Err(nb::Error::Other(_)) => {return Err(nb::Error::Other(EncodeError::WriteError));},
+        }
+
+        self.state = EncoderState::WriteNext;
+
+        Ok(())
     }
 
     ///
@@ -256,88 +282,76 @@ impl<T> Encoder<T>
     ///
     ///
     pub fn write(&mut self, buf: &[u8]) -> nb::Result<usize, EncodeError> {
-        // Signal end-of-frame if needed
-        if let EncoderState::End = self.state {
-            // This state is only possible if buf.len() is equal to or less than one, so signal to
-            // the application that it made an error if we detect otherwise. The application can
-            // recover from this state by calling `write()` with buf.len() equal to zero.
-            if buf.len() > 1 {
-                return Err(nb::Error::Other(EncodeError::BufferChanged));
-            }
-
-            // Try to write the end-of-frame character
-            match (self.writer)(END) {
-                Ok(_) => {
-                    self.state = EncoderState::ReadFromBuf;
-                    return Ok(buf.len());
-                },
-                Err(nb::Error::WouldBlock) => {
-                    return Err(nb::Error::WouldBlock);
-                },
-                Err(nb::Error::Other()) => {
-                    return Err(nb::Error::Other(EncodeError::WriteError));
-                },
-            }
-        }
-
-        let mut num_read: usize = 0;
+        let mut num_written = 0;
         for item in buf {
-            // Some values require multiple symbols to be written, so loop until all needed symbols
-            // are written for this item
-            loop {
-                let (next_state, increment_counter, val_to_write) = match self.state {
-                    EncoderState::ReadFromBuf => {
-                        match item {
-                            END => (EncoderState::EscapeEnd, false, ESC),
-                            ESC => (EncoderState::EscapeEscape, false, ESC),
-                            x => (EncoderState::ReadFromBuf, true, x),
-                        }
-                    },
-                    EncoderState::EscapeEscape => {
-                        (EncoderState::ReadFromBuf, true, ESC_ESC)
-                    },
-                    EncoderState::EscapeEnd => {
-                        (EncoderState::ReadFromBuf, true, ESC_END)
-                    },
-                    EncoderState::End, => {
-                        (EncoderState::ReadFromBuf, true, END)
-                    },
-                };
-            }
+            // Write out the item in the buffer. Some values will require two writes.
+            let write_result = match self.state {
+                EncoderState::WriteNext => {
+                    match *item {
+                        ESC => {self.write_two(ESC, ESC_ESC)},
+                        END => {self.write_two(ESC, ESC_END)},
+                        other => {self.write_one(other)},
+                    }
+                },
+                EncoderState::WriteSpecial(val) => {
+                    self.write_one(val)
+                },
+            };
 
-            match (self.writer)(val_to_write) {
-                Ok(_) => {
-                    
+            match write_result {
+                Ok(()) => {
+                    self.state = EncoderState::WriteNext;
+                    num_written += 1;
                 },
                 Err(nb::Error::WouldBlock) => {
-                    if num_read > 0 {
-                        return Ok(num_read);
+                    if num_written > 0 {
+                        return Ok(num_written);
                     } else {
                         return Err(nb::Error::WouldBlock);
                     }
                 },
-                Err(nb::Error::Other(_)) => {
-                    return Err(nb::Error::Other(EncodeError::WriteError));
+                Err(other_err_type) => {
+                    return Err(other_err_type);
                 },
             }
         }
 
         // Write end-of-frame
-        match (self.writer)(END) {
-            Ok(_) => {
-                self.state = EncoderState::ReadFromBuf;
-                return Ok(buf.len());
+        match self.write_one(END) {
+            Ok(()) => {
+                Ok(num_written)
             },
             Err(nb::Error::WouldBlock) => {
-                self.state = EncoderState::End;
-                return Ok(num_read);
+                self.state = EncoderState::WriteSpecial(END); // TODO: correctly handle blocking on END character
+                if num_written > 0 {
+                    // Don't count the last byte until END is written
+                    Ok(num_written - 1)
+                } else {
+                    Err(nb::Error::WouldBlock)
+                }
             },
-            Err(nb::Error::Other()) => {
-                self.state = EncoderState::ReadFromBuf;
-                return Err(nb::Error::Other(EncodeError::WriteError));
+            Err(other) => {
+                Err(other)
             },
         }
     }
+}
+
+pub fn encode_to_buffer(buffer: &mut [u8]) -> Encoder<impl FnMut(u8) -> nb::Result<(),()> + '_> {
+    let mut buffer_iterator = buffer.iter_mut();
+    let writer = move |val| {
+        match buffer_iterator.next() {
+            Some(next_slot) => {
+                *next_slot = val;
+                Ok(())
+            },
+            None => {
+                Err(nb::Error::Other(()))
+            },
+        }
+    };
+
+    Encoder::new(writer)
 }
 
 
@@ -368,5 +382,17 @@ mod tests {
         let mut decoder = Decoder::new(|| {Err(nb::Error::Other(()))});
         let read_result = decoder.read(&mut packet[..]);
         assert_eq!(read_result, Err(nb::Error::Other(DecodeError::ReadError)));
+    }
+
+    #[test]
+    fn test_encode_u8_slice() {
+        let input_data: [u8; 8] = [0x00, 0x11, 0x22, ESC, 0x33, END, 0x44, 0x55];
+        let mut output_packet: [u8; 128] = [0; 128];
+        let write_result = {
+            let mut encoder = encode_to_buffer(&mut output_packet[..]);
+            encoder.write(&input_data[..])
+        };
+        assert_eq!(write_result, Ok(input_data.len()));
+        assert_eq!(output_packet[0..11], [0x00, 0x11, 0x22, ESC, ESC_ESC, 0x33, ESC, ESC_END, 0x44, 0x55, END]);
     }
 }
