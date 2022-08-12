@@ -284,10 +284,24 @@ impl<T> Encoder<T>
     /// # Arguments
     ///
     /// * `buf` - A `u8` slice to encode. The encoder might not write out the whole slice in one
-    ///    call.
+    ///           call, so the application must call `write` until the total number of bytes
+    ///           written equals the length of `buf`.
     ///
     ///
     /// # Results
+    ///
+    /// * `nb::Result::Err(nb::Error::WouldBlock)` is returned if the underlying writer would block
+    ///   and a complete character hasn't been written yet. Note that this does not mean nothing
+    ///   was written, since some characters need to be escaped and the last character needs to be
+    ///   followed by END.
+    /// * `nb::Result::Err(nb::Error::Other(rfc1055::EncodeError::WriteError))` is returned if the
+    ///   underlying writer had an error. The application should abort writing the frame in this
+    ///   instance.
+    /// * `nb::Result::Err(nb::Error::Other(rfc1055::EncodeError::BufferChanged))` is returned if
+    ///   the encoder detects that the u8 slice wasn't updated correctly after the last command.
+    ///   If this is returned there is a bug in the calling application.
+    /// * `nb::Result::Ok(usize)` is returned if at least one full character was written, including
+    ///   any escape or end characters. It will never exceed the length of `buf`.
     ///
     ///
     pub fn write(&mut self, buf: &[u8]) -> nb::Result<usize, EncodeError> {
