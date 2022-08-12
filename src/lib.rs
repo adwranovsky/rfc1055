@@ -402,6 +402,32 @@ mod tests {
     // Decoder tests
     //
 
+    fn decode_blocking(input: &[u8], output: &mut [u8]) -> Result<usize, DecodeError> {
+        let mut decoder = {
+            let mut buffer_iterator = input.iter();
+            let mut block: bool = false;
+            let reader = move || {
+                block = !block;
+                if block {
+                    return Err(nb::Error::WouldBlock);
+                }
+                match buffer_iterator.next() {
+                    Some(x) => { return Ok(*x); },
+                    None => { return Err(nb::Error::Other(())); },
+                }
+            };
+            Decoder::new(reader)
+        };
+
+        let mut num_read = 0;
+        loop {
+            match block!(decoder.read(&mut output[num_read..]))? {
+                0 => { return Ok(num_read); },
+                x => { num_read += x; },
+            }
+        }
+    }
+
     #[test]
     fn test_decode_u8_slice() {
         let data_stream: [u8; 11] = [END, 0x00, 0x11, 0x22, ESC, ESC_END, ESC, ESC_ESC, 0x33, 0x44, END];
@@ -427,6 +453,23 @@ mod tests {
         assert_eq!(read_result, Err(nb::Error::Other(DecodeError::ReadError)));
     }
 
+    #[test]
+    fn test_decode_blocking() {
+        let mut output: [u8; 128] = [0; 128];
+
+        let input: [u8; 12] = [END, 0x00, 0x11, 0x22, ESC, ESC_ESC, 0x33, ESC, ESC_END, 0x44, 0x55, END];
+        assert_eq!(decode_blocking(&input[..], &mut output[..]), Ok(8));
+        assert_eq!(output[0..8], [0x00, 0x11, 0x22, ESC, 0x33, END, 0x44, 0x55]);
+
+        let input: [u8; 6] = [END, ESC, ESC_END, ESC, ESC_END, END];
+        assert_eq!(decode_blocking(&input[..], &mut output[..]), Ok(2));
+        assert_eq!(output[0..2], [END, END]);
+
+        let input: [u8; 4] = [END, ESC, ESC_ESC, END];
+        assert_eq!(decode_blocking(&input[..], &mut output[..]), Ok(1));
+        assert_eq!(output[0..1], [ESC]);
+    }
+
 
     //
     // Encoder tests
@@ -434,6 +477,39 @@ mod tests {
 
     fn encode(input: &[u8], output: &mut [u8]) -> Result<(), EncodeError> {
         let mut encoder = encode_to_buffer(&mut output[..]);
+
+        let mut num_written = 0;
+        loop {
+            num_written += block!(encoder.write(&input[num_written..]))?;
+
+            if num_written == input.len() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn encode_blocking(input: &[u8], output: &mut [u8]) -> Result<(), EncodeError> {
+        let mut encoder = {
+            // Make an encoder that blocks on every other write, starting with the first one
+            let mut buffer_iterator = output.iter_mut();
+            let mut block: bool = false;
+            let writer = move |val| {
+                block = !block;
+                if block {
+                    return Err(nb::Error::WouldBlock);
+                }
+                match buffer_iterator.next() {
+                    Some(next_slot) => {
+                        *next_slot = val;
+                        Ok(())
+                    },
+                    None => {
+                        Err(nb::Error::Other(()))
+                    },
+                }
+            };
+            Encoder::new(writer)
+        };
 
         let mut num_written = 0;
         loop {
@@ -478,6 +554,22 @@ mod tests {
 
     #[test]
     fn test_encode_blocking() {
+        let mut output: [u8; 128] = [0; 128];
 
+        let input: [u8; 8] = [0x00, 0x11, 0x22, ESC, 0x33, END, 0x44, 0x55];
+        assert_eq!(encode_blocking(&input[..], &mut output[..]), Ok(()));
+        assert_eq!(output[0..11], [0x00, 0x11, 0x22, ESC, ESC_ESC, 0x33, ESC, ESC_END, 0x44, 0x55, END]);
+
+        let input: [u8; 0] = [];
+        assert_eq!(encode_blocking(&input[..], &mut output[..]), Ok(()));
+        assert_eq!(output[0], END);
+
+        let input: [u8; 2] = [END, END];
+        assert_eq!(encode_blocking(&input[..], &mut output[..]), Ok(()));
+        assert_eq!(output[0..5], [ESC, ESC_END, ESC, ESC_END, END]);
+
+        let input: [u8; 1] = [ESC];
+        assert_eq!(encode_blocking(&input[..], &mut output[..]), Ok(()));
+        assert_eq!(output[0..3], [ESC, ESC_ESC, END]);
     }
 }
