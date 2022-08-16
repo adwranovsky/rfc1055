@@ -8,7 +8,7 @@ use rfc1055::nb;
 use rfc1055::nb::block;
 
 extern crate clap;
-use clap::{Command, Arg, ArgMatches, crate_version, crate_authors};
+use clap::{Command, Arg, arg, ArgMatches, crate_version, crate_authors};
 
 
 fn main() -> Result<(), std::io::Error> {
@@ -41,20 +41,16 @@ fn main() -> Result<(), std::io::Error> {
             Command::new("encode")
                 .about("Encode RFC1055 frames")
                 .arg(
-                    Arg::with_name("output")
-                         .short('o')
-                         .long("output")
-                         .value_name("output")
-                         .help("The path to the file to use as output. If \"-\" or no file is specified, use stdout.")
-                         .takes_value(true)
+                    arg!(
+                        -o --output <output> "The path to the file to use as output. If \"-\" or no file is specified, use stdout."
+                    )
+                    .required(false)
                 )
                 .arg(
-                    Arg::with_name("input")
-                        .short('i')
-                        .long("input")
-                        .value_name("input")
-                        .help("The path to the file to use as input. If \"-\" or no file is specified, use stdin.")
-                        .takes_value(true)
+                    arg!(
+                        [input] ... "The input files to write in-order to the output. Each is encoded as a separate packet. If \"-\" or no file is specified, use stdin"
+                    )
+                    .default_value("-")
                 )
         )
         .after_help(
@@ -92,27 +88,35 @@ fn encode_command(matches: &ArgMatches) -> Result<(), std::io::Error> {
         }
     );
 
-    // Read input to EOF and convert to u8 slice
-    let mut input: Vec<u8> = Vec::new();
-    match matches.get_one::<String>("input") {
-        Some(path) if path != "-" => { todo!("Implement opening files") },
-        _ => { stdin().read_to_end(&mut input)?; },
-    };
-    let input = input.as_slice();
-
-    // Encode the whole input as a single packet, bailing on IO errors
-    let mut num_written = 0;
-    loop {
-        num_written += match block!(encoder.write(&input[num_written..])) {
-            Ok(n) => { n },
-            Err(_) => { return Err(std::io::Error::last_os_error()); },
+    // Iterate through all input files in order
+    for input_file_path in matches.get_many::<String>("input").expect("an input file is required") {
+        // Read input to EOF and convert to u8 slice
+        let input = if input_file_path == "-" {
+            let mut input_vec: Vec<u8> = Vec::new();
+            stdin().read_to_end(&mut input_vec)?;
+            input_vec
+        } else {
+            let mut input_vec: Vec<u8> = Vec::new();
+            File::open(input_file_path)?.read_to_end(&mut input_vec)?;
+            input_vec
         };
+        let input = input.as_slice();
 
-        if num_written == input.len() {
-            return Ok(());
+        // Encode the whole input as a single packet, bailing on IO errors
+        let mut num_written = 0;
+        loop {
+            num_written += match block!(encoder.write(&input[num_written..])) {
+                Ok(n) => { n },
+                Err(_) => { return Err(std::io::Error::last_os_error()); },
+            };
+
+            if num_written == input.len() {
+                break;
+            }
         }
     }
 
+    Ok(())
 }
 
 fn decode_command(matches: &ArgMatches) -> Result<(), std::io::Error> {
