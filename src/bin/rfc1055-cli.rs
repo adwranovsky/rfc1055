@@ -72,8 +72,17 @@ fn main() -> Result<(), std::io::Error> {
 fn encode_command(matches: &ArgMatches) -> Result<(), std::io::Error> {
     // Get the selected data sink
     let mut writer: BufWriter<Box<dyn Write>> = match matches.get_one::<String>("output") {
-        Some(path) if path != "-" => { todo!("Implement opening files") },
-        _ => { BufWriter::new(Box::new(stdout())) },
+        Some(path) if path != "-" => {
+            BufWriter::new(Box::new(
+                File::options()
+                    .create(true)
+                    .write(true)
+                    .open(path)?
+            ))
+        },
+        _ => {
+            BufWriter::new(Box::new(stdout()))
+        },
     };
 
     // Create the encoder from the sink
