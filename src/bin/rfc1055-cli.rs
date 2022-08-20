@@ -8,7 +8,7 @@ use rfc1055::nb;
 use rfc1055::nb::block;
 
 extern crate clap;
-use clap::{Command, Arg, arg, ArgMatches, crate_version, crate_authors};
+use clap::{Command, arg, ArgMatches, crate_version, crate_authors};
 
 
 fn main() -> Result<(), std::io::Error> {
@@ -21,20 +21,16 @@ fn main() -> Result<(), std::io::Error> {
             Command::new("decode")
                 .about("Decode RFC1055 frames")
                 .arg(
-                    Arg::with_name("output")
-                         .short('o')
-                         .long("output")
-                         .value_name("output")
-                         .help("The path to the file to use as output. If \"-\" or no file is specified, use stdout.")
-                         .takes_value(true)
+                    arg!(
+                        -i --input <input> "The path to the file to use as input. If \"-\" or no file is specified, use stdin."
+                    )
+                    .required(false)
                 )
                 .arg(
-                    Arg::with_name("input")
-                        .short('i')
-                        .long("input")
-                        .value_name("input")
-                        .help("The path to the file to use as input. If \"-\" or no file is specified, use stdin.")
-                        .takes_value(true)
+                    arg!(
+                        [output] ... "The output files to write in-order. Each will contain the content of a single decoded packet. If \"-\" or no file is specified, use stdout."
+                    )
+                    .default_value("-")
                 )
         )
         .subcommand(
@@ -89,10 +85,10 @@ fn encode_command(matches: &ArgMatches) -> Result<(), std::io::Error> {
     let mut encoder = rfc1055::Encoder::new(
         move |b: u8| {
             match writer.write(slice::from_ref(&b)) {
-                Ok(0) => { Err(nb::Error::Other(())) },
-                Ok(n) => { Ok(()) },
-                Err(e) if e.kind() == ErrorKind::Interrupted => { Err(nb::Error::WouldBlock) },
-                Err(_) => { Err(nb::Error::Other(())) },
+                Ok(0) => Err(nb::Error::Other(())),
+                Ok(_) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::Interrupted => Err(nb::Error::WouldBlock),
+                Err(_) => Err(nb::Error::Other(())),
             }
         }
     );
@@ -115,7 +111,7 @@ fn encode_command(matches: &ArgMatches) -> Result<(), std::io::Error> {
         let mut num_written = 0;
         loop {
             num_written += match block!(encoder.write(&input[num_written..])) {
-                Ok(n) => { n },
+                Ok(n) => n,
                 Err(_) => { return Err(std::io::Error::last_os_error()); },
             };
 
@@ -129,5 +125,47 @@ fn encode_command(matches: &ArgMatches) -> Result<(), std::io::Error> {
 }
 
 fn decode_command(matches: &ArgMatches) -> Result<(), std::io::Error> {
+    // Get the selected data source
+    let mut reader: BufReader<Box<dyn Read>> = match matches.get_one::<String>("input") {
+        Some(path) if path != "-" => BufReader::new(Box::new(File::open(path)?)),
+        _ => BufReader::new(Box::new(stdin())),
+    };
+
+    // Create the decoder from the source
+    let mut decoder = rfc1055::Decoder::new(
+        move || {
+            let mut b: [u8; 1] = [0];
+            match reader.read(&mut b[..]) {
+                Ok(0) => Err(nb::Error::Other(())),
+                Ok(n) => Ok(n.try_into().unwrap()),
+                Err(e) if e.kind() == ErrorKind::Interrupted => Err(nb::Error::WouldBlock),
+                Err(_) => Err(nb::Error::Other(())),
+            }
+        }
+    );
+
+    // Iterate through all all output files in order
+    for output_file_path in matches.get_many::<String>("output").expect("an output file is required") {
+        // Open the current data sink
+        let mut output: BufWriter<Box<dyn Write>> = match output_file_path as &str {
+            "-" => BufWriter::new(Box::new(stdout())),
+            p => BufWriter::new(Box::new(File::options().create(true).write(true).open(p)?)),
+        };
+
+        // Decode a whole, singular packet, bailing on IO errors
+        loop {
+            // Read up to 1 kB at a time
+            let mut buffer: [u8; 1024] = [0; 1024];
+            let num_read = match block!(decoder.read(&mut buffer[..])) {
+                Ok(0) => { break; },
+                Ok(n) => n,
+                Err(_) => { return Err(std::io::Error::last_os_error()); },
+            };
+
+            // Write to the data sink
+            output.write_all(&buffer[..num_read])?;
+        }
+    }
+
     Ok(())
 }
