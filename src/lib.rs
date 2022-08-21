@@ -42,10 +42,12 @@ impl<T> Decoder<T>
     /// # Arguments
     ///
     /// * `reader` - A function that reads individual `u8`s from some input source that may block.
+    /// * `discard` - If true, then the decoder will discard all input until it receives an END
+    ///               character. Else, it will start decoding straight away.
     ///
-    pub fn new(reader: T) -> Decoder<T> {
+    pub fn new(reader: T, discard: bool) -> Decoder<T> {
         Decoder {
-            state: DecoderState::DiscardToEnd,
+            state: if discard { DecoderState::DiscardToEnd } else { DecoderState::WriteToBuf },
             reader: reader,
         }
     }
@@ -89,7 +91,7 @@ impl<T> Decoder<T>
     /// };
     /// fn main() {
     ///     let data_stream: [u8; 11] = [END, 0xaa, 0xbb, 0xcc, ESC, ESC_END, ESC, ESC_ESC, 0xdd, 0xee, END];
-    ///     let mut decoder = rfc1055::decode_from_buffer(&data_stream[..]);
+    ///     let mut decoder = rfc1055::decode_from_buffer(&data_stream[..], true);
     ///     let mut packet: [u8; 7] = [0; 7];
     ///
     ///     let read_result = decoder.read(&mut packet[..]);
@@ -197,7 +199,7 @@ impl<T> Decoder<T>
     }
 }
 
-pub fn decode_from_buffer(buffer: &[u8]) -> Decoder<impl FnMut() -> nb::Result<u8,()> + '_> {
+pub fn decode_from_buffer(buffer: &[u8], discard: bool) -> Decoder<impl FnMut() -> nb::Result<u8,()> + '_> {
     let mut buffer_iterator = buffer.iter();
     let reader = move || {
         match buffer_iterator.next() {
@@ -206,7 +208,7 @@ pub fn decode_from_buffer(buffer: &[u8]) -> Decoder<impl FnMut() -> nb::Result<u
         }
     };
 
-    Decoder::new(reader)
+    Decoder::new(reader, discard)
 }
 
 #[derive(PartialEq)]
@@ -430,7 +432,7 @@ mod tests {
                     None => { return Err(nb::Error::Other(())); },
                 }
             };
-            Decoder::new(reader)
+            Decoder::new(reader, true)
         };
 
         let mut num_read = 0;
@@ -445,7 +447,7 @@ mod tests {
     #[test]
     fn test_decode_u8_slice() {
         let data_stream: [u8; 11] = [END, 0x00, 0x11, 0x22, ESC, ESC_END, ESC, ESC_ESC, 0x33, 0x44, END];
-        let mut decoder = decode_from_buffer(&data_stream[..]);
+        let mut decoder = decode_from_buffer(&data_stream[..], true);
 
         let mut packet: [u8; 128] = [0; 128];
         let read_result = decoder.read(&mut packet[..]);
@@ -458,11 +460,11 @@ mod tests {
         let data_stream: [u8; 4] = [END, ESC, 0x00, END];
         let mut packet: [u8; 128] = [0; 128];
 
-        let mut decoder = decode_from_buffer(&data_stream[..]);
+        let mut decoder = decode_from_buffer(&data_stream[..], true);
         let read_result = decoder.read(&mut packet[..]);
         assert_eq!(read_result, Err(nb::Error::Other(DecodeError::BadEscape)));
 
-        let mut decoder = Decoder::new(|| {Err(nb::Error::Other(()))});
+        let mut decoder = Decoder::new(|| {Err(nb::Error::Other(()))}, true);
         let read_result = decoder.read(&mut packet[..]);
         assert_eq!(read_result, Err(nb::Error::Other(DecodeError::ReadError)));
     }
