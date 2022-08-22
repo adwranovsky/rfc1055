@@ -8,7 +8,7 @@ use rfc1055::nb;
 use rfc1055::nb::block;
 
 extern crate clap;
-use clap::{Command, arg, ArgMatches, crate_version, crate_authors};
+use clap::{Command, arg, ArgMatches, ArgAction, crate_version, crate_authors};
 
 
 fn main() -> Result<(), std::io::Error> {
@@ -20,6 +20,12 @@ fn main() -> Result<(), std::io::Error> {
         .subcommand(
             Command::new("decode")
                 .about("Decode RFC1055 frames")
+                .arg(
+                    arg!(
+                        -d --discard "Discard all input up to the first END character received"
+                    )
+                    .action(ArgAction::SetTrue)
+                )
                 .arg(
                     arg!(
                         -i --input <input> "The path to the file to use as input. If \"-\" or no file is specified, use stdin."
@@ -132,16 +138,18 @@ fn decode_command(matches: &ArgMatches) -> Result<(), std::io::Error> {
     };
 
     // Create the decoder from the source
+    let discard = *matches.get_one::<bool>("discard").unwrap();
     let mut decoder = rfc1055::Decoder::new(
         move || {
             let mut b: [u8; 1] = [0];
             match reader.read(&mut b[..]) {
                 Ok(0) => Err(nb::Error::Other(())),
-                Ok(n) => Ok(n.try_into().unwrap()),
+                Ok(_) => Ok(b[0]),
                 Err(e) if e.kind() == ErrorKind::Interrupted => Err(nb::Error::WouldBlock),
                 Err(_) => Err(nb::Error::Other(())),
             }
-        }
+        },
+        discard,
     );
 
     // Iterate through all all output files in order
@@ -159,7 +167,7 @@ fn decode_command(matches: &ArgMatches) -> Result<(), std::io::Error> {
             let num_read = match block!(decoder.read(&mut buffer[..])) {
                 Ok(0) => { break; },
                 Ok(n) => n,
-                Err(_) => { return Err(std::io::Error::last_os_error()); },
+                Err(_) => { break; },
             };
 
             // Write to the data sink

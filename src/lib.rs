@@ -234,6 +234,13 @@ pub struct Encoder<T>
 impl<T> Encoder<T>
     where T: FnMut(u8) -> nb::Result<(),()>
 {
+    ///
+    /// Create a new encoder using the provided writer.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - A function that writes individual `u8`s to some sink that may block.
+    ///
     pub fn new(writer: T) -> Encoder<T> {
         Encoder {
             state: EncoderState::WriteNext,
