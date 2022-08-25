@@ -1,21 +1,134 @@
-//#![deny(missing_docs)]
+/*
+ * Copyright 2022 Alexander D Wranovsky
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*!
+
+This crate provides a library for encoding and decoding RFC1055 Serial Line Internet Protocol
+(SLIP) frames. The crate is intended to be used in an embedded environment, so it requires
+neither `std` nor `alloc`, and it makes use of the non-blocking `nb` crate.
+
+For more information on RFC1055, see <https://datatracker.ietf.org/doc/html/rfc1055>.
+
+# Getting Started
+
+First, read the documentation for [Decoder::read], [Decoder::new], [Encoder::write], and
+[Encoder::new]. After that, read the source code for the bundled command line tool and the tests.
+
+# Examples
+
+```rust
+#![macro_use]
+use rfc1055::nb;
+use rfc1055::nb::block;
+use rfc1055::{Decoder,Encoder,END};
+
+fn uart_getchar() -> nb::Result<u8, ()> {
+    // replace with your UART implementation
+    Ok(END)
+}
+
+fn uart_putchar(byte: u8) -> nb::Result<(), ()> {
+    // replace with your UART implementation
+    Ok(())
+}
+
+fn main() {
+    let mut decoder = Decoder::new(uart_getchar, true);
+    let mut encoder = Encoder::new(uart_putchar);
+    let mut buffer: [u8; 1024] = [0; 1024]; // Max frame size of 1 kB
+
+    'top: loop {
+        // Get the next frame
+        let frame_length = {
+            let mut num_read = 0;
+            loop {
+                num_read += match block!(decoder.read(&mut buffer[num_read..])) {
+                    Ok(0) => { break; }, // `read` returns 0 to indicate the end of a frame
+                    Ok(n) => n,
+                    Err(_) => { continue 'top; },
+                };
+            }
+            num_read
+        };
+
+        // Do some stuff with the received frame
+        // ...
+
+        // Echo the frame back on the transmitter
+        let mut num_written = 0;
+        loop {
+            num_written += match block!(encoder.write(&buffer[num_written..frame_length])) {
+                Ok(n) => n,
+                Err(_) => { continue 'top; },
+            };
+
+            if num_written == frame_length {
+                break;
+            }
+        }
+
+        break;
+    }
+}
+```
+
+
+# Command Line Interface
+
+This library also comes with a command line interface that is built when the `build-binary` feature
+is enabled. For example:
+
+```shell
+> cargo build --features build-binary
+> cd target/debug
+> echo 'hello world!' | ./rfc1055-cli encode | tee /tmp/encoded_data.bin | ./rfc1055-cli decode
+hello world!
+> xxd /tmp/encoded_data.bin
+00000000: 6865 6c6c 6f20 776f 726c 6421 0ac0       hello world!..
+```
+
+*/
+
+
+#![deny(missing_docs)]
 #![deny(warnings)]
 #![no_std]
 
-// https://datatracker.ietf.org/doc/html/rfc1055
 
 pub use nb;
 
+/// The `u8` value that signals the end of an RFC1055 frame.
 pub const END: u8 = 0o300;
+/// The `u8` value that signals the start of an escape sequence.
 pub const ESC: u8 = 0o333;
+/// `ESC` followed by `ESC_END` indicates a value of `END` was sent on the line
 pub const ESC_END: u8 = 0o334;
+/// `ESC` followed by `ESC_ESC` indicates a value of `ESC` was sent on the line
 pub const ESC_ESC: u8 = 0o335;
 
+/// Errors that can occur in [Decoder::read]
 #[derive(PartialEq)]
 #[derive(Debug)]
 pub enum DecodeError {
+    /// Indicates that `ESC` was read on the line, but followed by something other than `ESC_END`
+    /// or `ESC_ESC`.
     BadEscape,
+    /// Indicates that the underlying reader function returned an error while decoding.
     ReadError,
+    /// Indicates that the application passed a buffer with a length of 0 into the decoder.
     ZeroLengthBuffer,
 }
 
@@ -26,6 +139,8 @@ enum DecoderState {
     End,
 }
 
+/// An RFC1055 decoder. It contains the current state of the decoder as well as a pointer to a
+/// read routine that fetches individual bytes from some source.
 pub struct Decoder<T>
     where T: FnMut() -> nb::Result<u8,()>
 {
@@ -199,6 +314,16 @@ impl<T> Decoder<T>
     }
 }
 
+///
+/// Create a decoder that reads from a `u8` slice.
+///
+/// # Arguments
+///
+/// * `buffer` - The `u8` slice to read from. The decoder holds onto this reference for the
+///              lifetime of the decoder.
+/// * `discard` - If true, then discard all input until the first `END` character is found, else
+///               begin decoding immediately.
+///
 pub fn decode_from_buffer(buffer: &[u8], discard: bool) -> Decoder<impl FnMut() -> nb::Result<u8,()> + '_> {
     let mut buffer_iterator = buffer.iter();
     let reader = move || {
@@ -211,10 +336,14 @@ pub fn decode_from_buffer(buffer: &[u8], discard: bool) -> Decoder<impl FnMut() 
     Decoder::new(reader, discard)
 }
 
+/// Errors that occur in [Encoder::write]
 #[derive(PartialEq)]
 #[derive(Debug)]
 pub enum EncodeError {
+    /// Indicates that the application changed what buffer was being used (or failed to update the
+    /// start index) while in the middle of sending an escape sequence or end-of-frame character
     BufferChanged,
+    /// Indicates that the underlying writer function returned an error while encoding
     WriteError,
 }
 
@@ -224,6 +353,8 @@ enum EncoderState {
     WriteTwoSpecial((u8,u8)),
 }
 
+/// An RFC1055 encoder. It contains the state of the encoder as well as a pointer to a write
+/// routine that writes individual bytes to some sink.
 pub struct Encoder<T>
     where T: FnMut(u8) -> nb::Result<(),()>
 {
@@ -300,9 +431,9 @@ impl<T> Encoder<T>
     /// # Results
     ///
     /// * `nb::Result::Err(nb::Error::WouldBlock)` is returned if the underlying writer would block
-    ///   and a complete character hasn't been written yet. Note that this does not mean nothing
-    ///   was written, since some characters need to be escaped and the last character needs to be
-    ///   followed by END.
+    ///    and a complete character hasn't been written yet. Note that some characters may have
+    ///    still been written, since some characters need to be escaped and the last character
+    ///    needs to be followed by END.
     /// * `nb::Result::Err(nb::Error::Other(rfc1055::EncodeError::WriteError))` is returned if the
     ///   underlying writer had an error. The application should abort writing the frame in this
     ///   instance.
@@ -398,6 +529,15 @@ impl<T> Encoder<T>
     }
 }
 
+///
+/// Create an encoder which writes to a mutable `u8` slice.
+///
+/// # Arguments
+///
+/// * `buffer` - The mutable `u8` slice to which the encoded data should be written. The encoder
+///              holds onto a mutable reference, which means that the encoder needs to go out of
+///              scope and be destroyed before the contents can be read.
+///
 pub fn encode_to_buffer(buffer: &mut [u8]) -> Encoder<impl FnMut(u8) -> nb::Result<(),()> + '_> {
     let mut buffer_iterator = buffer.iter_mut();
     let writer = move |val| {
