@@ -110,6 +110,9 @@ hello world!
 
 pub use nb;
 
+#[cfg(feature = "network-interface")]
+pub mod network_interface;
+
 /// The `u8` value that signals the end of an RFC1055 frame.
 pub const END: u8 = 0o300;
 /// The `u8` value that signals the start of an escape sequence.
