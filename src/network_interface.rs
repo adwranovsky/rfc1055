@@ -20,59 +20,89 @@ The `network_interface` module provides a way to send TCP/IP data with smoltcp o
 
 */
 
-#[cfg(feature = "network-interface")]
+use crate::{Decoder, Encoder, nb};
+use smoltcp::Result;
+use smoltcp::phy::{self, DeviceCapabilities, Medium};
+use smoltcp::time::Instant;
+
+const MTU: usize = 1536;
+
+struct NetworkInterface<R,W>
+    where
+        R: FnMut() -> nb::Result<u8,()>,
+        W: FnMut(u8) -> nb::Result<(),()>,
 {
+    decoder: Decoder<R>,
+    encoder: Encoder<W>,
 
-    use smoltcp::Result;
-    use smoltcp::phy::{self, DeviceCapabilities, Device, Medium};
-    use smoltcp::time::Instant;
+    // Only save space for a single TX frame and a single RX frame at a time for now
+    rx_buffer: [u8; MTU],
+    tx_buffer: [u8; MTU],
+}
 
-    struct<'a> NetworkInterface {
-        // tx and rx buffers
-    }
-
-    impl<'a> phy::Device<'a> for NetworkInterface {
-        type RxToken = ;
-        type TxToken = ;
-
-        fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-            // ... receive logic ...
-        }
-
-        fn transmit(&'a mut self) -> Option<Self::TxToken> {
-            // ... transmit logic ...
-        }
-
-        fn capabilities(&self) -> DeviceCapabilities {
-            let mut caps = DeviceCapabilities::default();
-            caps.max_transmission_unit = ;
-            caps.max_burst_size = ;
-            caps.medium = Medium::Ethernet;
-            caps
+impl<R,W> NetworkInterface<R,W>
+    where
+        R: FnMut() -> nb::Result<u8,()>,
+        W: FnMut(u8) -> nb::Result<(),()>,
+{
+    pub fn new(reader: R, writer: W) -> NetworkInterface<R,W> {
+        NetworkInterface {
+            decoder: Decoder::new(reader, true),
+            encoder: Encoder::new(writer),
+            rx_buffer: [0; 1536],
+            tx_buffer: [0; 1536],
         }
     }
+}
 
-    struct NetworkInterfacePhyRxToken<'a>(&'a mut [u8]);
+impl<'a,R,W> phy::Device<'a> for NetworkInterface<R,W> 
+    where
+        R: FnMut() -> nb::Result<u8,()>,
+        W: FnMut(u8) -> nb::Result<(),()>,
+{
+    type RxToken = NetworkInterfacePhyRxToken<'a>;
+    type TxToken = NetworkInterfacePhyTxToken<'a>;
 
-    impl<'a> phy::RxToken for NetworkInterfacePhyRxToken<'a> {
-        fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
-            where F: FnOnce(&mut [u8]) -> Result<R>
-        {
-            // TODO: receive packet into buffer
-            let result = f(&mut self.0);
-            result
-        }
+    fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
+        Some((
+            NetworkInterfacePhyRxToken(&mut self.rx_buffer[..]),
+            NetworkInterfacePhyRxToken(&mut self.tx_buffer[..])
+        ))
     }
 
-    struct NetworkInterfacePhyTxToken<'a>(&'a mut [u8]);
+    fn transmit(&'a mut self) -> Option<Self::TxToken> {
+        Some(NetworkInterfacePhyRxToken(&mut self.tx_buffer[..]))
+    }
 
-    impl<'a> phy::TxToken for NetworkInterfacePhyTxToken<'a> {
-        fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
-            where F: FnOnce(&mut [u8]) -> Result<R>
-        {
-            let result = f(&mut self.0[..len]);
-            // TODO: send packet out
-            result
-        }
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.max_transmission_unit = MTU;
+        caps.max_burst_size = Some(1);
+        caps.medium = Medium::Ethernet;
+        caps
+    }
+}
+
+struct NetworkInterfacePhyRxToken<'a>(&'a mut [u8]);
+
+impl<'a> phy::RxToken for NetworkInterfacePhyRxToken<'a> {
+    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
+        where F: FnOnce(&mut [u8]) -> Result<R>
+    {
+        // TODO: receive packet into buffer
+        let result = f(&mut self.0);
+        result
+    }
+}
+
+struct NetworkInterfacePhyTxToken<'a>(&'a mut [u8]);
+
+impl<'a> phy::TxToken for NetworkInterfacePhyTxToken<'a> {
+    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
+        where F: FnOnce(&mut [u8]) -> Result<R>
+    {
+        let result = f(&mut self.0[..len]);
+        // TODO: send packet out
+        result
     }
 }
