@@ -111,7 +111,9 @@ hello world!
 pub use nb;
 
 #[cfg(feature = "network-interface")]
-pub mod network_interface;
+mod network_interface;
+#[cfg(feature = "network-interface")]
+pub use network_interface::NetworkInterface;
 
 /// The `u8` value that signals the end of an RFC1055 frame.
 pub const END: u8 = 0o300;
