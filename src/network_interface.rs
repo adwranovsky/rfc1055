@@ -37,6 +37,11 @@ enum RxState {
     Ready(usize),
 }
 
+enum TxState {
+    ClearToSend,
+    Wait,
+}
+
 /// A [smoltcp] PHY consisting an [crate::Decoder] and [crate::Encoder]. Currently only
 /// supports a burst size of 1.
 pub struct NetworkInterface<'a,R,W>
@@ -50,6 +55,7 @@ pub struct NetworkInterface<'a,R,W>
     // Only save space for a single TX frame and a single RX frame at a time for now
     rx_state: RxState,
     rx_buffer: &'a mut [u8],
+    tx_state: TxState,
     tx_buffer: &'a mut [u8],
 }
 
@@ -71,6 +77,7 @@ impl<'a,R,W> NetworkInterface<'a,R,W>
             rx_state: RxState::Reading(0),
             rx_buffer: rx_buffer,
 
+            tx_state: TxState::Wait,
             tx_buffer: tx_buffer,
         }
     }
@@ -95,13 +102,17 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
     type TxToken = TxToken<'a, W>;
 
     fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        // Poll the connected device for data by sending an end-of-frame character
-        match self.send_eof() {
-            _ => {},
-        }
-
-        // Try to read more data
+        // If we don't have a full frame buffered attempt to read the next one
         if let RxState::Reading(total_read) = self.rx_state {
+            // If we haven't received any fragments of the next frame, poll the connected device
+            // for data by sending an end-of-frame character
+            if total_read == 0 {
+                match self.send_eof() {
+                    _ => {},
+                }
+            }
+
+            // Try to read more data
             match self.decoder.read(&mut self.rx_buffer[total_read..]) {
                 Err(nb::Error::WouldBlock) => {
                     return None;
@@ -113,7 +124,17 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
                 },
                 Ok(0) => {
                     // `read` returns 0 to indicate the end of a frame
-                    self.rx_state = RxState::Ready(total_read);
+                    if total_read > 0 {
+                        self.rx_state = RxState::Ready(total_read);
+                    } else {
+                        // If the device's link partner sent a frame with 0 length, that means
+                        // we're clear to send more data
+                        self.tx_state = TxState::ClearToSend;
+
+                        // Reset RX state and return
+                        self.rx_state = RxState::Reading(0);
+                        return None;
+                    }
                 },
                 Ok(n) => {
                     // We read a partial frame so return `None`
@@ -124,7 +145,7 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
         }
 
         // Return rx and tx tokens if both interfaces are ready
-        if let RxState::Ready(num_rx) = &self.rx_state {
+        if let (TxState::ClearToSend, RxState::Ready(num_rx)) = (&self.tx_state, &self.rx_state) {
             return Some((
                 RxToken (
                     &mut self.rx_buffer[..*num_rx],
@@ -133,6 +154,7 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
                 TxToken {
                     buffer: &mut self.tx_buffer[..],
                     encoder: &mut self.encoder,
+                    tx_state: &mut self.tx_state,
                 },
             ))
         } else {
@@ -141,12 +163,17 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
     }
 
     fn transmit(&'a mut self) -> Option<Self::TxToken> {
-        Some(
-            TxToken {
-                buffer: &mut self.tx_buffer[..],
-                encoder: &mut self.encoder,
-            },
-        )
+        if let TxState::ClearToSend = self.tx_state {
+            Some(
+                TxToken {
+                    buffer: &mut self.tx_buffer[..],
+                    encoder: &mut self.encoder,
+                    tx_state: &mut self.tx_state,
+                },
+            )
+        } else {
+            None
+        }
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -164,6 +191,7 @@ pub struct TxToken<'a, T>
 {
     buffer: &'a mut [u8],
     encoder: &'a mut Encoder<T>,
+    tx_state: &'a mut TxState,
 }
 
 impl<'a> phy::RxToken for RxToken<'a> {
@@ -196,6 +224,8 @@ impl<'a, T> phy::TxToken for TxToken<'a, T>
                 break;
             }
         }
+        // Wait to send another frame until the link partner requests it
+        *self.tx_state = TxState::Wait;
         result
     }
 }
