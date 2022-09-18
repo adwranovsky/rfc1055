@@ -20,30 +20,26 @@ The `network_interface` module provides a way to send TCP/IP data with smoltcp o
 
 */
 
+use core::cmp::min;
 use crate::{
     Decoder,
     Encoder,
+    EncodeError,
     nb,
+    nb::block,
 };
 use smoltcp;
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
-
-const MTU: usize = 1536;
 
 enum RxState {
     Reading(usize),
     Ready(usize),
 }
 
-enum TxState {
-    Idle,
-    Writing(usize,usize), // (num_written, frame_length)
-}
-
 /// A [smoltcp] PHY consisting an [crate::Decoder] and [crate::Encoder]. Currently only
-/// supports a burst size of 1 and an MTU of 1536.
-pub struct NetworkInterface<R,W>
+/// supports a burst size of 1.
+pub struct NetworkInterface<'a,R,W>
     where
         R: FnMut() -> nb::Result<u8,()>,
         W: FnMut(u8) -> nb::Result<(),()>,
@@ -53,41 +49,57 @@ pub struct NetworkInterface<R,W>
 
     // Only save space for a single TX frame and a single RX frame at a time for now
     rx_state: RxState,
-    rx_buffer: [u8; MTU],
-    tx_state: TxState,
-    tx_buffer: [u8; MTU],
+    rx_buffer: &'a mut [u8],
+    tx_buffer: &'a mut [u8],
 }
 
-impl<R,W> NetworkInterface<R,W>
+impl<'a,R,W> NetworkInterface<'a,R,W>
     where
         R: FnMut() -> nb::Result<u8,()>,
         W: FnMut(u8) -> nb::Result<(),()>,
 {
     /// Creates a network interface from the given reader and writer. See [crate::Decoder::new]
-    /// and [crate::Encoder::new] for descriptions on the `reader` and `writer` arguments.
-    pub fn new(reader: R, writer: W) -> NetworkInterface<R,W> {
+    /// and [crate::Encoder::new] for descriptions on the `reader` and `writer` arguments. The two
+    /// buffers are where incomplete packet data will be stored. `tx_buffer` and `rx_buffer` should
+    /// be of the same length. If they are different, then the extra space in the longer buffer
+    /// will go unused.
+    pub fn new(reader: R, writer: W, tx_buffer: &'a mut [u8], rx_buffer: &'a mut [u8]) -> NetworkInterface<'a,R,W> {
         NetworkInterface {
             decoder: Decoder::new(reader, true),
             encoder: Encoder::new(writer),
 
             rx_state: RxState::Reading(0),
-            rx_buffer: [0; 1536],
+            rx_buffer: rx_buffer,
 
-            tx_state: TxState::Idle,
-            tx_buffer: [0; 1536],
+            tx_buffer: tx_buffer,
         }
+    }
+
+    /// Send an end-of-frame character. This is required to poll for data on some SLIP endpoints
+    /// e.g. [SatCat5](https://github.com/the-aerospace-corporation/satcat5).
+    pub fn send_eof(&mut self) -> Result<(),EncodeError> {
+        // If TX behavior is ever changed to non-blocking, this function cannot proceed if we're in
+        // the middle of sending an actual frame
+        let empty_buf = [];
+        block!(self.encoder.write(&empty_buf[..]))?;
+        Ok(())
     }
 }
 
-impl<'a,R,W> phy::Device<'a> for NetworkInterface<R,W> 
+impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W> 
     where
         R: FnMut() -> nb::Result<u8,()> + 'a,
         W: FnMut(u8) -> nb::Result<(),()> + 'a,
 {
     type RxToken = RxToken<'a>;
-    type TxToken = TxToken<'a>;
+    type TxToken = TxToken<'a, W>;
 
     fn receive(&'a mut self) -> Option<(Self::RxToken, Self::TxToken)> {
+        // Poll the connected device for data by sending an end-of-frame character
+        match self.send_eof() {
+            _ => {},
+        }
+
         // Try to read more data
         if let RxState::Reading(total_read) = self.rx_state {
             match self.decoder.read(&mut self.rx_buffer[total_read..]) {
@@ -112,70 +124,34 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<R,W>
         }
 
         // Return rx and tx tokens if both interfaces are ready
-        let num_rx = if let (RxState::Ready(num_rx), TxState::Idle) = (&self.rx_state, &self.tx_state) {
-            *num_rx
+        if let RxState::Ready(num_rx) = &self.rx_state {
+            return Some((
+                RxToken (
+                    &mut self.rx_buffer[..*num_rx],
+                    &mut self.rx_state,
+                ),
+                TxToken {
+                    buffer: &mut self.tx_buffer[..],
+                    encoder: &mut self.encoder,
+                },
+            ))
         } else {
             return None;
-        };
-
-        Some((
-            RxToken (
-                &mut self.rx_buffer[..num_rx],
-                &mut self.rx_state,
-            ),
-            TxToken (
-                &mut self.tx_buffer[..],
-                &mut self.tx_state,
-            ),
-        ))
+        }
     }
 
     fn transmit(&'a mut self) -> Option<Self::TxToken> {
-        // Write data if we're holding onto a frame
-        if let TxState::Writing(total_written, frame_length) = self.tx_state {
-            match self.encoder.write(&self.tx_buffer[total_written..frame_length]) {
-                Err(nb::Error::WouldBlock) => {
-                    return None;
-                },
-                Err(nb::Error::Other(_)) => {
-                    // Reset the TX interface on error and return the frame back to the application
-                    self.tx_state = TxState::Idle;
-                    Some(
-                        TxToken (
-                            &mut self.tx_buffer[..],
-                            &mut self.tx_state,
-                        )
-                    )
-                },
-                Ok(n) => {
-                    if total_written+n == frame_length {
-                        // We finished writing the frame so return the buffer back up to the
-                        // application
-                        Some(
-                            TxToken (
-                                &mut self.tx_buffer[..],
-                                &mut self.tx_state,
-                            )
-                        )
-                    } else {
-                        self.tx_state = TxState::Writing(total_written+n, frame_length);
-                        None
-                    }
-                },
-            }
-        } else {
-            Some(
-                TxToken (
-                    &mut self.tx_buffer[..],
-                    &mut self.tx_state,
-                )
-            )
-        }
+        Some(
+            TxToken {
+                buffer: &mut self.tx_buffer[..],
+                encoder: &mut self.encoder,
+            },
+        )
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = MTU;
+        caps.max_transmission_unit = min(self.tx_buffer.len(), self.rx_buffer.len());
         caps.max_burst_size = Some(1);
         caps.medium = Medium::Ethernet;
         caps
@@ -183,7 +159,12 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<R,W>
 }
 
 pub struct RxToken<'a>(&'a mut [u8], &'a mut RxState);
-pub struct TxToken<'a>(&'a mut [u8], &'a mut TxState);
+pub struct TxToken<'a, T> 
+    where T: FnMut(u8) -> nb::Result<(),()>
+{
+    buffer: &'a mut [u8],
+    encoder: &'a mut Encoder<T>,
+}
 
 impl<'a> phy::RxToken for RxToken<'a> {
     fn consume<R, F>(self, _timestamp: Instant, f: F) -> smoltcp::Result<R>
@@ -196,13 +177,25 @@ impl<'a> phy::RxToken for RxToken<'a> {
     }
 }
 
-impl<'a> phy::TxToken for TxToken<'a> {
+impl<'a, T> phy::TxToken for TxToken<'a, T>
+    where T: FnMut(u8) -> nb::Result<(),()>
+{
     fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> smoltcp::Result<R>
         where F: FnOnce(&mut [u8]) -> smoltcp::Result<R>
     {
-        // Fetch the next frame and transition to the writing state
-        let result = f(&mut self.0[..len]);
-        *self.1 = TxState::Writing(0,len);
+        // Fetch the next frame and then write it out
+        let result = f(&mut self.buffer[..len]);
+        let mut num_written = 0;
+        loop {
+            num_written += match block!(self.encoder.write(&self.buffer[num_written..len])) {
+                Ok(n) => n,
+                Err(_) => { break; },
+            };
+
+            if num_written == len {
+                break;
+            }
+        }
         result
     }
 }

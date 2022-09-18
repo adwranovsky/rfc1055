@@ -11,6 +11,8 @@ nb = "1.0.0"
 # optional smoltcp dependency
 [dependencies.smoltcp]
 version = ">=0.8.0"
+default_features = false
+features = ["medium-ethernet","proto-ipv4","socket-tcp"]
 optional = true
 
 # rfc1055-cli dependencies
