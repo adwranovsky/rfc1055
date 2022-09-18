@@ -124,17 +124,15 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
                 },
                 Ok(0) => {
                     // `read` returns 0 to indicate the end of a frame
-                    if total_read > 0 {
-                        self.rx_state = RxState::Ready(total_read);
+                    self.rx_state = if total_read > 0 {
+                        RxState::Ready(total_read)
                     } else {
                         // If the device's link partner sent a frame with 0 length, that means
-                        // we're clear to send more data
-                        self.tx_state = TxState::ClearToSend;
-
-                        // Reset RX state and return
-                        self.rx_state = RxState::Reading(0);
-                        return None;
-                    }
+                        // we're clear to send more data, so just reset the RX interface and move
+                        // along
+                        RxState::Reading(0)
+                    };
+                    self.tx_state = TxState::ClearToSend;
                 },
                 Ok(n) => {
                     // We read a partial frame so return `None`
