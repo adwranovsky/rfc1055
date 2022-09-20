@@ -29,8 +29,19 @@ use crate::{
     nb::block,
 };
 use smoltcp;
-use smoltcp::phy::{self, DeviceCapabilities, Medium};
+use smoltcp::phy::{self, DeviceCapabilities, ChecksumCapabilities, Medium};
 use smoltcp::time::Instant;
+use crc::{Crc, CRC_32_BZIP2};
+
+macro_rules! inc_saturating {
+    ( $x:expr ) => {
+        $x = $x.saturating_add(1);
+    };
+}
+
+const FCS: Crc<u32> = Crc::<u32>::new(&CRC_32_BZIP2);
+const HEADER_LENGTH: usize = 14;
+const FCS_LENGTH: usize = 4;
 
 enum RxState {
     Reading(usize),
@@ -40,6 +51,20 @@ enum RxState {
 enum TxState {
     ClearToSend,
     Wait,
+}
+
+/// Stores various device statistics
+pub struct DeviceStatistics {
+    /// The number of complete RX frames received, regardless of CRC errors
+    pub rx_frames: u64,
+    /// The number of times that the decoder returned an error while reading
+    pub rx_read_errors: u64,
+    /// The number of RX frames that failed the CRC check
+    pub rx_crc_errors: u64,
+    /// The number of complete TX frames sent, regardless of TX errors
+    pub tx_frames: u64,
+    /// The number of times that the encoder returned an error while writing
+    pub tx_write_errors: u64,
 }
 
 /// A [smoltcp] PHY consisting an [crate::Decoder] and [crate::Encoder]. Currently only
@@ -57,6 +82,8 @@ pub struct NetworkInterface<'a,R,W>
     rx_buffer: &'a mut [u8],
     tx_state: TxState,
     tx_buffer: &'a mut [u8],
+
+    statistics: DeviceStatistics,
 }
 
 impl<'a,R,W> NetworkInterface<'a,R,W>
@@ -79,6 +106,14 @@ impl<'a,R,W> NetworkInterface<'a,R,W>
 
             tx_state: TxState::Wait,
             tx_buffer: tx_buffer,
+
+            statistics: DeviceStatistics {
+                rx_frames: 0,
+                rx_read_errors: 0,
+                rx_crc_errors: 0,
+                tx_frames: 0,
+                tx_write_errors: 0,
+            },
         }
     }
 
@@ -90,6 +125,11 @@ impl<'a,R,W> NetworkInterface<'a,R,W>
         let empty_buf = [];
         block!(self.encoder.write(&empty_buf[..]))?;
         Ok(())
+    }
+
+    /// Get the device statistics
+    pub fn get_statistics(&self) -> &DeviceStatistics {
+        &self.statistics
     }
 }
 
@@ -119,19 +159,35 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
                 },
                 Err(nb::Error::Other(_)) => {
                     // Reset the RX interface on error
+                    inc_saturating!(self.statistics.rx_read_errors);
                     self.rx_state = RxState::Reading(0);
                     return None;
                 },
                 Ok(0) => {
                     // `read` returns 0 to indicate the end of a frame
-                    self.rx_state = if total_read > 0 {
-                        RxState::Ready(total_read)
+                    self.rx_state = if total_read >= HEADER_LENGTH + FCS_LENGTH {
+                        inc_saturating!(self.statistics.rx_frames);
+                        // We received a full frame, so compute the checksum
+                        let fcs = &self.rx_buffer[total_read-FCS_LENGTH..total_read];
+                        let fcs = u32::from_be_bytes([fcs[0], fcs[1], fcs[2], fcs[3]]);
+                        let rest_of_frame = &self.rx_buffer[..total_read-FCS_LENGTH];
+                        if FCS.checksum(rest_of_frame) == fcs {
+                            // Frame is good, so pass it up to the next layer
+                            RxState::Ready(total_read - FCS_LENGTH)
+                        } else {
+                            // Frame is bad, so record it and move on
+                            inc_saturating!(self.statistics.rx_crc_errors);
+                            RxState::Reading(0)
+                        }
                     } else {
                         // If the device's link partner sent a frame with 0 length, that means
                         // we're clear to send more data, so just reset the RX interface and move
-                        // along
+                        // along. Treat frames that are shorter than HEADER_LENGTH + FCS_LENGTH the
+                        // same way.
                         RxState::Reading(0)
                     };
+                    // Receiving an end-of-frame always indicates that the link partner is ready to
+                    // receive more data
                     self.tx_state = TxState::ClearToSend;
                 },
                 Ok(n) => {
@@ -153,6 +209,7 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
                     buffer: &mut self.tx_buffer[..],
                     encoder: &mut self.encoder,
                     tx_state: &mut self.tx_state,
+                    statistics: &mut self.statistics,
                 },
             ))
         } else {
@@ -167,6 +224,7 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
                     buffer: &mut self.tx_buffer[..],
                     encoder: &mut self.encoder,
                     tx_state: &mut self.tx_state,
+                    statistics: &mut self.statistics,
                 },
             )
         } else {
@@ -176,9 +234,10 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = min(self.tx_buffer.len(), self.rx_buffer.len());
+        caps.max_transmission_unit = min(self.tx_buffer.len(), self.rx_buffer.len()) - FCS_LENGTH;
         caps.max_burst_size = Some(1);
         caps.medium = Medium::Ethernet;
+        caps.checksum = ChecksumCapabilities::default();
         caps
     }
 }
@@ -190,6 +249,7 @@ pub struct TxToken<'a, T>
     buffer: &'a mut [u8],
     encoder: &'a mut Encoder<T>,
     tx_state: &'a mut TxState,
+    statistics: &'a mut DeviceStatistics,
 }
 
 impl<'a> phy::RxToken for RxToken<'a> {
@@ -209,13 +269,24 @@ impl<'a, T> phy::TxToken for TxToken<'a, T>
     fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> smoltcp::Result<R>
         where F: FnOnce(&mut [u8]) -> smoltcp::Result<R>
     {
-        // Fetch the next frame and then write it out
+        // Fetch the next frame
         let result = f(&mut self.buffer[..len]);
+
+        // Compute checksum and append to frame
+        let fcs = FCS.checksum(&self.buffer[..len]).to_be_bytes();
+        self.buffer[len..FCS_LENGTH].clone_from_slice(&fcs);
+        let len = len + FCS_LENGTH;
+
+        // Send frame
+        inc_saturating!(self.statistics.tx_frames);
         let mut num_written = 0;
         loop {
             num_written += match block!(self.encoder.write(&self.buffer[num_written..len])) {
                 Ok(n) => n,
-                Err(_) => { break; },
+                Err(_) => { 
+                    inc_saturating!(self.statistics.tx_write_errors);
+                    break; 
+                },
             };
 
             if num_written == len {
