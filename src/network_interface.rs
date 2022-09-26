@@ -31,15 +31,15 @@ use crate::{
 use smoltcp;
 use smoltcp::phy::{self, DeviceCapabilities, ChecksumCapabilities, Medium};
 use smoltcp::time::Instant;
-use crc::{Crc, CRC_32_BZIP2};
+use crc::{Crc, CRC_32_ISO_HDLC};
 
 macro_rules! inc_saturating {
     ( $x:expr ) => {
         $x = $x.saturating_add(1);
     };
 }
-
-const FCS: Crc<u32> = Crc::<u32>::new(&CRC_32_BZIP2);
+const FCS: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+const MAGIC_CHECK: u32 = 0x2144DF1C;
 const HEADER_LENGTH: usize = 14;
 const FCS_LENGTH: usize = 4;
 
@@ -167,11 +167,10 @@ impl<'a,R,W> phy::Device<'a> for NetworkInterface<'_,R,W>
                     // `read` returns 0 to indicate the end of a frame
                     self.rx_state = if total_read >= HEADER_LENGTH + FCS_LENGTH {
                         inc_saturating!(self.statistics.rx_frames);
-                        // We received a full frame, so compute the checksum
-                        let fcs = &self.rx_buffer[total_read-FCS_LENGTH..total_read];
-                        let fcs = u32::from_be_bytes([fcs[0], fcs[1], fcs[2], fcs[3]]);
-                        let rest_of_frame = &self.rx_buffer[..total_read-FCS_LENGTH];
-                        if FCS.checksum(rest_of_frame) == fcs {
+                        // We received a full frame, so compute the checksum of the whole frame
+                        // against the magic verify value
+                        let checksum = FCS.checksum(&self.rx_buffer[..total_read]);
+                        if checksum == MAGIC_CHECK {
                             // Frame is good, so pass it up to the next layer
                             RxState::Ready(total_read - FCS_LENGTH)
                         } else {
@@ -273,8 +272,8 @@ impl<'a, T> phy::TxToken for TxToken<'a, T>
         let result = f(&mut self.buffer[..len]);
 
         // Compute checksum and append to frame
-        let fcs = FCS.checksum(&self.buffer[..len]).to_be_bytes();
-        self.buffer[len..FCS_LENGTH].clone_from_slice(&fcs);
+        let fcs = FCS.checksum(&self.buffer[..len]).to_le_bytes();
+        self.buffer[len..len+FCS_LENGTH].copy_from_slice(&fcs);
         let len = len + FCS_LENGTH;
 
         // Send frame
